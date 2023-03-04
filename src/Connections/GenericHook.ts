@@ -8,7 +8,7 @@ import { Appservice, Intent, StateEvent } from "matrix-bot-sdk";
 import { ApiError, ErrCode } from "../api";
 import { BaseConnection } from "./BaseConnection";
 import { GetConnectionsResponseItem } from "../provisioning/api";
-import { BridgeConfigGenericWebhooks, BridgeConfigEncryption } from "../Config/Config";
+import { BridgeConfigGenericWebhooks } from "../Config/Config";
 import { ensureUserIsInRoom } from "../IntentUtils";
 import { randomUUID } from 'node:crypto';
 
@@ -45,12 +45,24 @@ export interface GenericHookAccountData {
     [hookId: string]: string;
 }
 
-interface WebhookTransformationResult {
+interface RawWebhookTransformationResult {
     version: string;
     plain?: string;
     html?: string;
     msgtype?: string;
     empty?: boolean;
+    roomAvatar?: string;
+    roomTopic?: string;
+}
+
+type WebhookTransformationResult = Pick<RawWebhookTransformationResult, "plain" | "html" | "msgtype" | "roomAvatar" | "roomTopic">;
+
+interface IncomingWebhookData {
+    msgtype?: string;
+    plain?: string;
+    html?: string;
+    roomAvatar?: string;
+    roomTopic?: string;
 }
 
 interface MessageContent {
@@ -287,21 +299,29 @@ export class GenericHookConnection extends BaseConnection implements IConnection
         this.state = validatedConfig;
     }
 
-    public transformHookData(data: unknown): {plain: string, html?: string} {
+    public transformHookData(data: unknown): {plain: string, html?: string, roomAvatar?: string, roomTopic?: string} {
         // Supported parameters https://developers.mattermost.com/integrate/incoming-webhooks/#parameters
-        const msg: {plain: string, html?: string} = {plain: ""};
+        const msg: {plain: string, html?: string, roomAvatar?: string, roomTopic?: string} = {plain: ""};
         const safeData = typeof data === "object" && data !== null ? data as Record<string, unknown> : undefined;
         if (typeof data === "string") {
             return {plain: `Received webhook data: ${data}`};
         } else if (typeof safeData?.text === "string") {
             msg.plain = safeData.text;
-        } else {
+        } else if (!safeData?.roomAvatar && !safeData?.roomTopic) {
             msg.plain = "Received webhook data:\n\n" + "```json\n\n" + JSON.stringify(data, null, 2) + "\n\n```";
             msg.html = `<p>Received webhook data:</p><p><pre><code class=\\"language-json\\">${JSON.stringify(data, null, 2)}</code></pre></p>`
         }
 
         if (typeof safeData?.html === "string") {
             msg.html = safeData.html;
+        }
+
+        if (typeof safeData?.roomAvatar === "string") {
+            msg.roomAvatar = safeData.roomAvatar;
+        }
+
+        if (typeof safeData?.roomTopic === "string") {
+            msg.roomTopic = safeData.roomTopic;
         }
 
         if (typeof safeData?.username === "string") {
@@ -315,10 +335,11 @@ export class GenericHookConnection extends BaseConnection implements IConnection
         return msg;
     }
 
-    public executeTransformationFunction(data: unknown): {plain: string, html?: string, msgtype?: string}|null {
+    public executeTransformationFunction(data: unknown): WebhookTransformationResult|null {
         if (!this.transformationFunction) {
             throw Error('Transformation function not defined');
         }
+
         const vm = new NodeVM({
             console: 'off',
             wrapper: 'none',
@@ -337,7 +358,7 @@ export class GenericHookConnection extends BaseConnection implements IConnection
         } else if (typeof result !== "object") {
             return {plain: `No content`};
         }
-        const transformationResult = result as WebhookTransformationResult;
+        const transformationResult = result as RawWebhookTransformationResult;
         if (transformationResult.version !== "v2") {
             throw Error("Result returned from transformation didn't specify version = v2");
         }
@@ -356,11 +377,19 @@ export class GenericHookConnection extends BaseConnection implements IConnection
         if (transformationResult.msgtype && typeof transformationResult.msgtype !== "string") {
             throw Error("Result returned from transformation didn't provide a string value for msgtype");
         }
+        if (transformationResult.roomAvatar && typeof transformationResult.roomAvatar !== "string") {
+            throw Error("Result returned from transformation didn't provide a string value for roomAvatar");
+        }
+        if (transformationResult.roomTopic && typeof transformationResult.roomTopic !== "string") {
+            throw Error("Result returned from transformation didn't provide a string value for roomTopic");
+        }
 
         return {
             plain: plain,
             html: transformationResult.html,
             msgtype: transformationResult.msgtype,
+            roomAvatar: transformationResult.roomAvatar,
+            roomTopic: transformationResult.roomTopic,
         }
     }
 
@@ -371,7 +400,7 @@ export class GenericHookConnection extends BaseConnection implements IConnection
      */
     public async onGenericHook(data: unknown): Promise<boolean> {
         log.info(`onGenericHook ${this.roomId} ${this.hookId}`);
-        let content: MessageContent;
+        let content: IncomingWebhookData;
         let success = true;
         if (!this.transformationFunction) {
             content = this.transformHookData(data);
@@ -393,20 +422,57 @@ export class GenericHookConnection extends BaseConnection implements IConnection
         const sender = this.getUserId();
         const senderIntent = this.as.getIntentForUserId(sender);
         await this.ensureDisplayname(senderIntent);
-
         await ensureUserIsInRoom(senderIntent, this.intent.underlyingClient, this.roomId);
 
         // Matrix cannot handle float data, so make sure we parse out any floats.
         const safeData = GenericHookConnection.sanitiseObjectForMatrixJSON(data);
 
-        await this.messageClient.sendMatrixMessage(this.roomId, {
-            msgtype: content.msgtype || "m.notice",
-            body: content.plain,
-            // render can output redundant trailing newlines, so trim it.
-            formatted_body: content.html || md.render(content.plain).trim(),
-            format: "org.matrix.custom.html",
-            "uk.half-shot.hookshot.webhook_data": safeData,
-        }, 'm.room.message', sender);
+        if (content.roomAvatar) {
+            // Update room avatar first, so that notifications will have the correct icon
+            try {
+                await this.messageClient.sendMatrixStateEvent({
+                    roomId: this.roomId,
+                    eventType: "m.room.avatar",
+                    stateKey: "",
+                    content: {
+                        url: content.roomAvatar,
+                    }
+                });
+            } catch (e) {
+                log.error(`Error updating room avatar of ${this.roomId} ${this.hookId}`, e);
+            }
+        }
+
+        if (content.roomTopic) {
+            try {
+                await this.messageClient.sendMatrixStateEvent({
+                    roomId: this.roomId,
+                    eventType: "m.room.topic",
+                    stateKey: "",
+                    content: {
+                        url: content.roomTopic,
+                    }
+                });
+            } catch (e) {
+                log.error(`Error updating room topic of ${this.roomId} ${this.hookId}`, e);
+            }
+        }
+
+        if (content.plain) {
+            try {
+                await this.messageClient.sendMatrixMessage(this.roomId, {
+                    msgtype: content.msgtype || "m.notice",
+                    body: content.plain,
+                    // render can output redundant trailing newlines, so trim it.
+                    formatted_body: content.html || md.render(content.plain).trim(),
+                    format: "org.matrix.custom.html",
+                    "uk.half-shot.hookshot.webhook_data": safeData,
+                }, 'm.room.message', sender);
+            } catch (e) {
+                log.error(`Error sending room message in ${this.roomId} ${this.hookId}`, e);
+            }
+        }
+
         return success;
     }
 
